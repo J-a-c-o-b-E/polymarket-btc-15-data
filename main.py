@@ -27,13 +27,15 @@ DEFAULT_QUOTE_NOTIONALS_USDC = [1, 10, 100, 1000, 10000]
 DEFAULT_POLL_SECONDS = 1.0
 
 # set to 15 for testing rotation, set back to 900 for production
-SESSION_SECONDS = 15
+SESSION_SECONDS = 15 * 60
 
 DEFAULT_REFRESH_SESSION_EVERY_SECONDS = 2.0
 DEFAULT_HTTP_TIMEOUT_SECONDS = 2.5
 
 DEFAULT_LOCAL_OUT_DIR = "session_csv"
-DEFAULT_DRIVE_FOLDER_PATH = ["Polymarket Data", "btc"]
+
+# IMPORTANT: set DRIVE_FOLDER_ID env var to your target folder id (Polymarket Data/btc)
+DEFAULT_DRIVE_FOLDER_ID = ""
 
 
 @dataclass
@@ -301,31 +303,6 @@ class DriveUploader:
         res = self.service.files().list(**params).execute()
         return res.get("files", [])
 
-    def _find_folder(self, name: str, parent_id: Optional[str]) -> Optional[str]:
-        mime = "application/vnd.google-apps.folder"
-        if parent_id:
-            q = f"name='{name}' and mimeType='{mime}' and '{parent_id}' in parents and trashed=false"
-        else:
-            q = f"name='{name}' and mimeType='{mime}' and trashed=false"
-        files = self._list(q)
-        return files[0]["id"] if files else None
-
-    def _create_folder(self, name: str, parent_id: Optional[str]) -> str:
-        metadata = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
-        if parent_id:
-            metadata["parents"] = [parent_id]
-        f = self.service.files().create(body=metadata, fields="id", supportsAllDrives=True).execute()
-        return f["id"]
-
-    def ensure_folder_path(self, path_parts: List[str]) -> str:
-        parent = None
-        for part in path_parts:
-            found = self._find_folder(part, parent)
-            if not found:
-                found = self._create_folder(part, parent)
-            parent = found
-        return parent
-
     def upload_or_update(self, local_path: str, drive_folder_id: str, drive_filename: str):
         q = f"name='{drive_filename}' and '{drive_folder_id}' in parents and trashed=false"
         existing = self._list(q)
@@ -372,16 +349,6 @@ def load_quote_notionals() -> List[int]:
         return DEFAULT_QUOTE_NOTIONALS_USDC
 
 
-def load_drive_folder_path() -> List[str]:
-    raw = os.getenv("DRIVE_FOLDER_PATH", "")
-    if raw.strip():
-        parts = [p.strip() for p in raw.split("/") if p.strip()]
-        return parts if parts else DEFAULT_DRIVE_FOLDER_PATH
-    root = os.getenv("DRIVE_ROOT_FOLDER", "Polymarket Data").strip() or "Polymarket Data"
-    sub = os.getenv("DRIVE_SUBFOLDER", "btc").strip() or "btc"
-    return [root, sub]
-
-
 def ensure_service_account_file() -> str:
     env_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     if env_json:
@@ -396,14 +363,17 @@ def ensure_service_account_file() -> str:
 def main():
     slug_url = os.getenv("SLUG_URL", DEFAULT_SLUG_URL)
     poll_seconds = float(os.getenv("POLL_SECONDS", str(DEFAULT_POLL_SECONDS)))
-    refresh_session_every = float(os.getenv("REFRESH_SESSION_EVERY_SECONDS", str(DEFAULT_REFRESH_SESSION_EVERY_SECONDS)))
+    refresh_session_every = float(os.getenv("REFRESH_SESSION_EVERY_SECONDS", "2.0"))
     http_timeout_seconds = float(os.getenv("HTTP_TIMEOUT_SECONDS", str(DEFAULT_HTTP_TIMEOUT_SECONDS)))
     local_out_dir = os.getenv("LOCAL_OUT_DIR", DEFAULT_LOCAL_OUT_DIR)
 
     quote_notionals_usdc = load_quote_notionals()
     notionals = [float(x) for x in quote_notionals_usdc]
 
-    drive_folder_path = load_drive_folder_path()
+    drive_folder_id = os.getenv("DRIVE_FOLDER_ID", DEFAULT_DRIVE_FOLDER_ID).strip()
+    if not drive_folder_id:
+        raise RuntimeError("missing DRIVE_FOLDER_ID env var (set it to your Polymarket Data/btc folder id)")
+
     shared_drive_id = os.getenv("SHARED_DRIVE_ID", "").strip() or None
     sa_path = ensure_service_account_file()
 
@@ -413,7 +383,6 @@ def main():
     slug_prefix = slug_prefix_from_slug(initial_slug)
 
     drive = DriveUploader(sa_path, shared_drive_id=shared_drive_id)
-    drive_folder_id = drive.ensure_folder_path(drive_folder_path)
 
     # one-time startup test upload so you see the real error immediately
     test_path = os.path.join(local_out_dir, "drive_test.csv")
@@ -445,13 +414,12 @@ def main():
     write_header(w, quote_notionals_usdc)
     f.flush()
 
-    print("drive_folder_path", "/".join(drive_folder_path))
+    print("drive_folder_id", drive_folder_id)
     print("poll_seconds", poll_seconds)
     print("session_seconds", SESSION_SECONDS)
     print("local_out_dir", os.path.abspath(local_out_dir))
     print("current_file", os.path.abspath(local_file))
 
-    # verbose upload with real error output
     def close_and_upload(path: str, filename: str) -> bool:
         for attempt in range(5):
             try:
