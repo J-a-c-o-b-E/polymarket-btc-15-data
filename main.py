@@ -41,9 +41,7 @@ DEFAULT_LOCAL_OUT_DIR = "session_csv"
 # market sessions are 15 minutes = 900 seconds
 DEFAULT_MARKET_BUCKET_SECONDS = 15
 
-# how often to upload snapshots to Drive during an ongoing session
-# for testing set UPLOAD_EVERY_SECONDS=15
-DEFAULT_UPLOAD_EVERY_SECONDS = DEFAULT_MARKET_BUCKET_SECONDS
+
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
