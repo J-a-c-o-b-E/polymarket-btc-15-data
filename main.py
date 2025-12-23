@@ -15,18 +15,20 @@ import asyncio
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
 
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
 
-
-# defaults
 DEFAULT_SLUG_URL = "https://polymarket.com/event/btc-updown-15m-1766449800"
 DEFAULT_QUOTE_NOTIONALS_USDC = [1, 10, 100, 1000, 10000]
 DEFAULT_POLL_SECONDS = 1.0
-SESSION_SECONDS = 15
+
+# set to 15 for testing rotation, set back to 900 for production
+SESSION_SECONDS = 15 * 60
+
 DEFAULT_REFRESH_SESSION_EVERY_SECONDS = 2.0
 DEFAULT_HTTP_TIMEOUT_SECONDS = 2.5
 
@@ -413,6 +415,18 @@ def main():
     drive = DriveUploader(sa_path, shared_drive_id=shared_drive_id)
     drive_folder_id = drive.ensure_folder_path(drive_folder_path)
 
+    # one-time startup test upload so you see the real error immediately
+    test_path = os.path.join(local_out_dir, "drive_test.csv")
+    with open(test_path, "w", encoding="utf-8") as tf:
+        tf.write("ok,utc\n")
+        tf.write(f"1,{utc_iso_now()}\n")
+
+    try:
+        drive.upload_or_update(test_path, drive_folder_id, "drive_test.csv")
+        print("drive_test_upload_ok")
+    except Exception as e:
+        print("drive_test_upload_failed", type(e).__name__, repr(e))
+
     feed = ChainlinkPriceFeed()
     feed.start()
 
@@ -437,13 +451,27 @@ def main():
     print("local_out_dir", os.path.abspath(local_out_dir))
     print("current_file", os.path.abspath(local_file))
 
+    # verbose upload with real error output
     def close_and_upload(path: str, filename: str) -> bool:
         for attempt in range(5):
             try:
                 drive.upload_or_update(path, drive_folder_id, filename)
                 return True
-            except Exception:
-                time.sleep(0.5 * (2 ** attempt))
+            except HttpError as e:
+                print(
+                    "upload_error_http",
+                    "attempt", attempt + 1,
+                    "status", getattr(e, "status_code", None),
+                    "error", str(e),
+                )
+            except Exception as e:
+                print(
+                    "upload_error",
+                    "attempt", attempt + 1,
+                    "type", type(e).__name__,
+                    "error", repr(e),
+                )
+            time.sleep(0.5 * (2 ** attempt))
         return False
 
     try:
