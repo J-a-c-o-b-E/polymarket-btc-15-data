@@ -1,14 +1,13 @@
 # main.py
 import asyncio
 import csv
-import io
 import json
 import os
 import time
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List
 
 import httpx
 import websockets
@@ -16,7 +15,7 @@ import websockets
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
 
@@ -29,6 +28,7 @@ RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
+
 # -----------------------------
 # defaults (override via env)
 # -----------------------------
@@ -36,14 +36,10 @@ DEFAULT_SLUG_URL = "https://polymarket.com/event/btc-updown-15m-1766449800"
 DEFAULT_QUOTE_NOTIONALS_USDC = [1, 10, 100, 1000, 10000]
 
 DEFAULT_POLL_SECONDS = 1.0
-DEFAULT_MARKET_BUCKET_SECONDS = 900  # 900 seconds
+DEFAULT_MARKET_BUCKET_SECONDS = 15 * 60  # 900 seconds
 DEFAULT_REFRESH_SESSION_EVERY_SECONDS = 2.0
 DEFAULT_HTTP_TIMEOUT_SECONDS = 2.5
 DEFAULT_LOCAL_OUT_DIR = "session_csv"
-
-# snapshot uploads during a session (for restart safety)
-# set to 0 to disable
-DEFAULT_UPLOAD_EVERY_SECONDS = 60.0
 
 
 # -----------------------------
@@ -322,127 +318,53 @@ def avg_fill_prices_for_notionals(asks: List[Tuple[float, float]], notionals: Li
 
 
 # -----------------------------
-# google drive (oauth user) + merge-safe update
+# google drive (oauth user)
 # -----------------------------
 class DriveUploader:
     def __init__(self):
-        client_json = os.getenv("GOOGLE_OAUTH_CLIENT_JSON", "").strip()
         token_json = os.getenv("GOOGLE_OAUTH_TOKEN_JSON", "").strip()
-        if not client_json or not token_json:
-            raise RuntimeError("missing GOOGLE_OAUTH_CLIENT_JSON or GOOGLE_OAUTH_TOKEN_JSON")
+        if not token_json:
+            raise RuntimeError("missing GOOGLE_OAUTH_TOKEN_JSON")
 
         token_info = json.loads(token_json)
         creds = Credentials.from_authorized_user_info(token_info, scopes=SCOPES)
+
         if not creds.valid and creds.refresh_token:
             creds.refresh(Request())
 
         self.service = build("drive", "v3", credentials=creds, cache_discovery=False)
 
-    def find_in_folder(self, drive_folder_id: str, filename: str) -> Optional[dict]:
-        q = f"name='{filename}' and '{drive_folder_id}' in parents and trashed=false"
+    def _list(self, q: str) -> List[dict]:
         res = self.service.files().list(
             q=q,
-            fields="files(id,name,size,modifiedTime)",
-            pageSize=10,
+            fields="files(id,name,mimeType,parents)",
+            pageSize=50,
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
         ).execute()
-        files = res.get("files", [])
-        return files[0] if files else None
+        return res.get("files", [])
 
-    def download_file_bytes(self, file_id: str) -> bytes:
-        request = self.service.files().get_media(fileId=file_id, supportsAllDrives=True)
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-        return fh.getvalue()
+    def upload_or_update(self, local_path: str, drive_folder_id: str, drive_filename: str):
+        q = f"name='{drive_filename}' and '{drive_folder_id}' in parents and trashed=false"
+        existing = self._list(q)
 
-    def create_file(self, local_path: str, drive_folder_id: str, filename: str):
         media = MediaFileUpload(local_path, mimetype="text/csv", resumable=True)
-        metadata = {"name": filename, "parents": [drive_folder_id]}
-        self.service.files().create(
-            body=metadata,
-            media_body=media,
-            fields="id",
-            supportsAllDrives=True,
-        ).execute()
 
-    def update_file(self, local_path: str, file_id: str):
-        media = MediaFileUpload(local_path, mimetype="text/csv", resumable=True)
-        self.service.files().update(
-            fileId=file_id,
-            media_body=media,
-            supportsAllDrives=True,
-        ).execute()
-
-
-def merge_csv_by_timestamp(remote_bytes: bytes, local_path: str) -> str:
-    """
-    Merge remote + local rows by timestamp_utc (union), keep header, sort by timestamp_utc.
-    Returns path to merged temp file.
-    """
-    remote_text = remote_bytes.decode("utf-8", errors="replace")
-    remote_lines = [ln for ln in remote_text.splitlines() if ln.strip()]
-
-    # read remote
-    remote_rows: Dict[str, List[str]] = {}
-    remote_header: Optional[List[str]] = None
-    if remote_lines:
-        rr = csv.reader(io.StringIO("\n".join(remote_lines)))
-        try:
-            remote_header = next(rr)
-        except StopIteration:
-            remote_header = None
-        if remote_header:
-            for row in rr:
-                if not row:
-                    continue
-                ts = row[0]
-                if ts:
-                    remote_rows[ts] = row
-
-    # read local
-    local_rows: Dict[str, List[str]] = {}
-    local_header: Optional[List[str]] = None
-    with open(local_path, "r", encoding="utf-8", newline="") as lf:
-        lr = csv.reader(lf)
-        try:
-            local_header = next(lr)
-        except StopIteration:
-            local_header = None
-        if local_header:
-            for row in lr:
-                if not row:
-                    continue
-                ts = row[0]
-                if ts:
-                    local_rows[ts] = row
-
-    header = local_header or remote_header
-    if not header:
-        return local_path
-
-    # union, prefer local row if same timestamp
-    merged = dict(remote_rows)
-    merged.update(local_rows)
-
-    merged_ts = sorted(merged.keys())
-    merged_path = local_path + ".merged"
-
-    with open(merged_path, "w", encoding="utf-8", newline="") as mf:
-        w = csv.writer(mf)
-        w.writerow(header)
-        for ts in merged_ts:
-            w.writerow(merged[ts])
-        mf.flush()
-        try:
-            os.fsync(mf.fileno())
-        except Exception:
-            pass
-
-    return merged_path
+        if existing:
+            file_id = existing[0]["id"]
+            self.service.files().update(
+                fileId=file_id,
+                media_body=media,
+                supportsAllDrives=True,
+            ).execute()
+        else:
+            metadata = {"name": drive_filename, "parents": [drive_folder_id]}
+            self.service.files().create(
+                body=metadata,
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
 
 
 # -----------------------------
@@ -471,55 +393,6 @@ def ensure_file_with_header(path: str, quote_notionals_usdc: List[int]) -> None:
 
 
 # -----------------------------
-# robust upload: merge-safe
-# -----------------------------
-def upload_or_merge_update(
-    drive: DriveUploader,
-    drive_folder_id: str,
-    local_path: str,
-    filename: str,
-) -> bool:
-    for attempt in range(5):
-        try:
-            existing = drive.find_in_folder(drive_folder_id, filename)
-            if not existing:
-                drive.create_file(local_path, drive_folder_id, filename)
-                return True
-
-            file_id = existing["id"]
-            remote_bytes = drive.download_file_bytes(file_id)
-            merged_path = merge_csv_by_timestamp(remote_bytes, local_path)
-
-            # overwrite local with merged so future snapshots keep growing
-            if merged_path != local_path:
-                try:
-                    os.replace(merged_path, local_path)
-                except Exception:
-                    pass
-
-            drive.update_file(local_path, file_id)
-            return True
-
-        except HttpError as e:
-            print(
-                "upload_error_http",
-                "attempt", attempt + 1,
-                "status", getattr(e, "status_code", None),
-                "error", str(e),
-            )
-        except Exception as e:
-            print(
-                "upload_error",
-                "attempt", attempt + 1,
-                "type", type(e).__name__,
-                "error", repr(e),
-            )
-        time.sleep(0.5 * (2 ** attempt))
-
-    return False
-
-
-# -----------------------------
 # main loop
 # -----------------------------
 def main():
@@ -529,7 +402,6 @@ def main():
     refresh_session_every = float(os.getenv("REFRESH_SESSION_EVERY_SECONDS", str(DEFAULT_REFRESH_SESSION_EVERY_SECONDS)))
     http_timeout_seconds = float(os.getenv("HTTP_TIMEOUT_SECONDS", str(DEFAULT_HTTP_TIMEOUT_SECONDS)))
     local_out_dir = os.getenv("LOCAL_OUT_DIR", DEFAULT_LOCAL_OUT_DIR)
-    upload_every_seconds = float(os.getenv("UPLOAD_EVERY_SECONDS", str(DEFAULT_UPLOAD_EVERY_SECONDS)))
 
     quote_notionals_usdc = load_int_list_env("QUOTE_NOTIONALS_USDC", DEFAULT_QUOTE_NOTIONALS_USDC)
     notionals = [float(x) for x in quote_notionals_usdc]
@@ -547,12 +419,12 @@ def main():
 
     # one-time startup upload test
     test_path = os.path.join(local_out_dir, "drive_test.csv")
-    with open(test_path, "w", encoding="utf-8", newline="") as tf:
+    with open(test_path, "w", encoding="utf-8") as tf:
         tf.write("ok,utc\n")
         tf.write(f"1,{utc_iso_now()}\n")
     try:
-        ok = upload_or_merge_update(drive, drive_folder_id, test_path, "drive_test.csv")
-        print("drive_test_upload_ok" if ok else "drive_test_upload_failed")
+        drive.upload_or_update(test_path, drive_folder_id, "drive_test.csv")
+        print("drive_test_upload_ok")
     except Exception as e:
         print("drive_test_upload_failed", type(e).__name__, repr(e))
 
@@ -579,20 +451,39 @@ def main():
     print("drive_folder_id", drive_folder_id)
     print("poll_seconds", poll_seconds)
     print("market_bucket_seconds", market_bucket_seconds)
-    print("upload_every_seconds", upload_every_seconds)
     print("local_out_dir", os.path.abspath(local_out_dir))
     print("current_file", os.path.abspath(local_file))
 
-    last_upload_ts = 0.0
+    def upload_with_logs(path: str, filename: str) -> bool:
+        for attempt in range(5):
+            try:
+                drive.upload_or_update(path, drive_folder_id, filename)
+                return True
+            except HttpError as e:
+                print(
+                    "upload_error_http",
+                    "attempt", attempt + 1,
+                    "status", getattr(e, "status_code", None),
+                    "error", str(e),
+                )
+            except Exception as e:
+                print(
+                    "upload_error",
+                    "attempt", attempt + 1,
+                    "type", type(e).__name__,
+                    "error", repr(e),
+                )
+            time.sleep(0.5 * (2 ** attempt))
+        return False
 
     try:
         while True:
             loop_start = time.perf_counter()
             now = time.time()
 
+            # rotate at bucket boundary, upload previous file once (end of session)
             bucket = current_bucket_ts(market_bucket_seconds)
             if bucket != current_bucket:
-                # close old file and upload final (merge-safe)
                 try:
                     fsync_flush(f)
                     f.close()
@@ -600,23 +491,22 @@ def main():
                     pass
 
                 prev_name = os.path.basename(local_file)
-                ok = upload_or_merge_update(drive, drive_folder_id, local_file, prev_name)
+                ok = upload_with_logs(local_file, prev_name)
                 print("uploaded" if ok else "upload_failed", prev_name)
 
-                # open new session file
                 current_bucket = bucket
                 current_slug = f"{slug_prefix}{current_bucket}"
                 local_file = os.path.join(local_out_dir, session_filename(slug_prefix, current_bucket))
                 ensure_file_with_header(local_file, quote_notionals_usdc)
+
                 f = open(local_file, "a", newline="", encoding="utf-8")
                 w = csv.writer(f)
 
-                # reset per-session
+                # reset per-session caches
                 last_up_asks = []
                 last_down_asks = []
                 state = None
                 last_refresh = 0.0
-                last_upload_ts = 0.0
 
             # refresh tokens for current session slug
             if state is None or (now - last_refresh) >= refresh_session_every:
@@ -640,9 +530,11 @@ def main():
                 up_asks = fetch_order_book_asks_safe(http, state.up_token_id, last_up_asks)
                 if up_asks:
                     last_up_asks = up_asks
+
                 down_asks = fetch_order_book_asks_safe(http, state.down_token_id, last_down_asks)
                 if down_asks:
                     last_down_asks = down_asks
+
             except (httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectError, httpx.PoolTimeout):
                 try:
                     http.close()
@@ -670,13 +562,6 @@ def main():
             w.writerow(row)
             fsync_flush(f)
 
-            # snapshot upload (merge-safe) to survive restarts
-            if upload_every_seconds > 0 and (now - last_upload_ts) >= upload_every_seconds:
-                last_upload_ts = now
-                name = os.path.basename(local_file)
-                ok = upload_or_merge_update(drive, drive_folder_id, local_file, name)
-                print("snapshot_uploaded" if ok else "snapshot_upload_failed", name)
-
             elapsed = time.perf_counter() - loop_start
             sleep_for = poll_seconds - elapsed
             if sleep_for > 0:
@@ -698,10 +583,10 @@ def main():
 
         feed.stop()
 
-        # final upload
+        # final upload for the currently-open session file
         try:
             name = os.path.basename(local_file)
-            ok = upload_or_merge_update(drive, drive_folder_id, local_file, name)
+            ok = upload_with_logs(local_file, name)
             print("uploaded" if ok else "upload_failed", name)
         except Exception:
             pass
