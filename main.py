@@ -19,32 +19,22 @@ from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
 
-# -----------------------------
-# endpoints
-# -----------------------------
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
-
-# -----------------------------
-# defaults (override via env)
-# -----------------------------
 DEFAULT_SLUG_URL = "https://polymarket.com/event/btc-updown-15m-1766449800"
 DEFAULT_QUOTE_NOTIONALS_USDC = [1, 10, 100, 1000, 10000]
 
 DEFAULT_POLL_SECONDS = 1.0
-DEFAULT_MARKET_BUCKET_SECONDS = 15 * 60  # 900 seconds
+DEFAULT_MARKET_BUCKET_SECONDS = 15 * 60
 DEFAULT_REFRESH_SESSION_EVERY_SECONDS = 2.0
 DEFAULT_HTTP_TIMEOUT_SECONDS = 2.5
 DEFAULT_LOCAL_OUT_DIR = "session_csv"
 
 
-# -----------------------------
-# helpers
-# -----------------------------
 @dataclass
 class SessionState:
     slug: str
@@ -118,9 +108,6 @@ def fsync_flush(f):
         pass
 
 
-# -----------------------------
-# chainlink BTC feed via polymarket websocket
-# -----------------------------
 class ChainlinkPriceFeed:
     def __init__(self):
         self._lock = threading.Lock()
@@ -151,13 +138,11 @@ class ChainlinkPriceFeed:
             ],
         }
         backoff = 0.5
-
         while not self._stop.is_set():
             try:
                 async with websockets.connect(RTDS_WS_URL, ping_interval=None) as ws:
                     await ws.send(json.dumps(sub_msg))
                     last_ping = time.time()
-
                     while not self._stop.is_set():
                         if time.time() - last_ping >= 5.0:
                             try:
@@ -197,9 +182,6 @@ class ChainlinkPriceFeed:
                 backoff = min(backoff * 1.6, 10.0)
 
 
-# -----------------------------
-# polymarket fetch
-# -----------------------------
 def make_http_client(http_timeout_seconds: float) -> httpx.Client:
     return httpx.Client(
         headers={"User-Agent": "pm-collector/1.0"},
@@ -264,7 +246,7 @@ def fetch_order_book_asks_safe(
                 except Exception:
                     pass
             if out:
-                out.sort(key=lambda x: x[0])  # cheapest first
+                out.sort(key=lambda x: x[0])
                 return out
             return prev
         except Exception:
@@ -317,9 +299,6 @@ def avg_fill_prices_for_notionals(asks: List[Tuple[float, float]], notionals: Li
     return results
 
 
-# -----------------------------
-# google drive (oauth user)
-# -----------------------------
 class DriveUploader:
     def __init__(self):
         token_json = os.getenv("GOOGLE_OAUTH_TOKEN_JSON", "").strip()
@@ -367,9 +346,6 @@ class DriveUploader:
             ).execute()
 
 
-# -----------------------------
-# csv
-# -----------------------------
 def session_filename(prefix: str, bucket_ts: int) -> str:
     return f"{prefix}{bucket_ts}.csv"
 
@@ -392,9 +368,6 @@ def ensure_file_with_header(path: str, quote_notionals_usdc: List[int]) -> None:
         fsync_flush(f)
 
 
-# -----------------------------
-# main loop
-# -----------------------------
 def main():
     slug_url = os.getenv("SLUG_URL", DEFAULT_SLUG_URL)
     poll_seconds = float(os.getenv("POLL_SECONDS", str(DEFAULT_POLL_SECONDS)))
@@ -402,6 +375,10 @@ def main():
     refresh_session_every = float(os.getenv("REFRESH_SESSION_EVERY_SECONDS", str(DEFAULT_REFRESH_SESSION_EVERY_SECONDS)))
     http_timeout_seconds = float(os.getenv("HTTP_TIMEOUT_SECONDS", str(DEFAULT_HTTP_TIMEOUT_SECONDS)))
     local_out_dir = os.getenv("LOCAL_OUT_DIR", DEFAULT_LOCAL_OUT_DIR)
+
+    # logging controls
+    log_every_n = int(os.getenv("LOG_EVERY_N", "1"))  # print every N ticks (1 = every second)
+    log_preview_notionals = int(os.getenv("LOG_PREVIEW_NOTIONALS", "3"))  # print first N notionals only
 
     quote_notionals_usdc = load_int_list_env("QUOTE_NOTIONALS_USDC", DEFAULT_QUOTE_NOTIONALS_USDC)
     notionals = [float(x) for x in quote_notionals_usdc]
@@ -476,12 +453,13 @@ def main():
             time.sleep(0.5 * (2 ** attempt))
         return False
 
+    tick = 0
+
     try:
         while True:
             loop_start = time.perf_counter()
             now = time.time()
 
-            # rotate at bucket boundary, upload previous file once (end of session)
             bucket = current_bucket_ts(market_bucket_seconds)
             if bucket != current_bucket:
                 try:
@@ -502,13 +480,12 @@ def main():
                 f = open(local_file, "a", newline="", encoding="utf-8")
                 w = csv.writer(f)
 
-                # reset per-session caches
                 last_up_asks = []
                 last_down_asks = []
                 state = None
                 last_refresh = 0.0
+                tick = 0
 
-            # refresh tokens for current session slug
             if state is None or (now - last_refresh) >= refresh_session_every:
                 last_refresh = now
                 try:
@@ -525,16 +502,13 @@ def main():
                 time.sleep(0.05)
                 continue
 
-            # books
             try:
                 up_asks = fetch_order_book_asks_safe(http, state.up_token_id, last_up_asks)
                 if up_asks:
                     last_up_asks = up_asks
-
                 down_asks = fetch_order_book_asks_safe(http, state.down_token_id, last_down_asks)
                 if down_asks:
                     last_down_asks = down_asks
-
             except (httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectError, httpx.PoolTimeout):
                 try:
                     http.close()
@@ -562,6 +536,17 @@ def main():
             w.writerow(row)
             fsync_flush(f)
 
+            # real-time log (minimal)
+            tick += 1
+            if log_every_n > 0 and (tick % log_every_n) == 0:
+                show_n = max(0, min(log_preview_notionals, len(notionals)))
+                parts = [f"ts={ts}", f"slug={state.slug}"]
+                for i in range(show_n):
+                    parts.append(f"up{int(notionals[i])}={cents(up_avg[i])}c")
+                    parts.append(f"dn{int(notionals[i])}={cents(down_avg[i])}c")
+                parts.append(f"btc={btc_price}")
+                print(" | ".join(parts))
+
             elapsed = time.perf_counter() - loop_start
             sleep_for = poll_seconds - elapsed
             if sleep_for > 0:
@@ -583,7 +568,6 @@ def main():
 
         feed.stop()
 
-        # final upload for the currently-open session file
         try:
             name = os.path.basename(local_file)
             ok = upload_with_logs(local_file, name)
