@@ -8,36 +8,49 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Tuple, List
 
+import asyncio
 import httpx
 import websockets
-import asyncio
 
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
 
+# -----------------------------
+# endpoints
+# -----------------------------
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
 
+
+# -----------------------------
+# defaults (override via env)
+# -----------------------------
 DEFAULT_SLUG_URL = "https://polymarket.com/event/btc-updown-15m-1766449800"
 DEFAULT_QUOTE_NOTIONALS_USDC = [1, 10, 100, 1000, 10000]
+
 DEFAULT_POLL_SECONDS = 1.0
-
-# set to 15 for testing rotation, set back to 900 for production
-SESSION_SECONDS = 15
-
 DEFAULT_REFRESH_SESSION_EVERY_SECONDS = 2.0
 DEFAULT_HTTP_TIMEOUT_SECONDS = 2.5
-
 DEFAULT_LOCAL_OUT_DIR = "session_csv"
 
-# IMPORTANT: set DRIVE_FOLDER_ID env var to your target folder id (Polymarket Data/btc)
-DEFAULT_DRIVE_FOLDER_ID = ""
+# market sessions are 15 minutes = 900 seconds
+DEFAULT_MARKET_BUCKET_SECONDS = 15
+
+# how often to upload snapshots to Drive during an ongoing session
+# for testing set UPLOAD_EVERY_SECONDS=15
+DEFAULT_UPLOAD_EVERY_SECONDS = DEFAULT_MARKET_BUCKET_SECONDS
+
+SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
+# -----------------------------
+# helpers
+# -----------------------------
 @dataclass
 class SessionState:
     slug: str
@@ -85,6 +98,24 @@ def maybe_json(v):
     return v
 
 
+def load_quote_notionals() -> List[int]:
+    raw = os.getenv("QUOTE_NOTIONALS_USDC", "").strip()
+    if not raw:
+        return DEFAULT_QUOTE_NOTIONALS_USDC
+    try:
+        vals = [int(x.strip()) for x in raw.split(",") if x.strip()]
+        return vals if vals else DEFAULT_QUOTE_NOTIONALS_USDC
+    except Exception:
+        return DEFAULT_QUOTE_NOTIONALS_USDC
+
+
+def cents(x: Optional[float]) -> Optional[float]:
+    return None if x is None else round(x * 100.0, 6)
+
+
+# -----------------------------
+# chainlink BTC feed via polymarket websocket
+# -----------------------------
 class ChainlinkPriceFeed:
     def __init__(self):
         self._lock = threading.Lock()
@@ -114,12 +145,14 @@ class ChainlinkPriceFeed:
                 {"topic": "crypto_prices_chainlink", "type": "*", "filters": "{\"symbol\":\"btc/usd\"}"}
             ],
         }
+
         backoff = 0.5
         while not self._stop.is_set():
             try:
                 async with websockets.connect(RTDS_WS_URL, ping_interval=None) as ws:
                     await ws.send(json.dumps(sub_msg))
                     last_ping = time.time()
+
                     while not self._stop.is_set():
                         if time.time() - last_ping >= 5.0:
                             try:
@@ -159,6 +192,9 @@ class ChainlinkPriceFeed:
                 backoff = min(backoff * 1.6, 10.0)
 
 
+# -----------------------------
+# polymarket fetch
+# -----------------------------
 def make_http_client(http_timeout_seconds: float) -> httpx.Client:
     return httpx.Client(
         headers={"User-Agent": "pm-collector/1.0"},
@@ -223,7 +259,7 @@ def fetch_order_book_asks_safe(
                 except Exception:
                     pass
             if out:
-                out.sort(key=lambda x: x[0])
+                out.sort(key=lambda x: x[0])  # cheapest first
                 return out
             return prev
         except Exception:
@@ -276,31 +312,32 @@ def avg_fill_prices_for_notionals(asks: List[Tuple[float, float]], notionals: Li
     return results
 
 
-def cents(x: Optional[float]) -> Optional[float]:
-    return None if x is None else round(x * 100.0, 6)
-
-
+# -----------------------------
+# google drive (oauth user)
+# -----------------------------
 class DriveUploader:
-    def __init__(self, service_account_json_path: str, shared_drive_id: Optional[str] = None):
-        scopes = ["https://www.googleapis.com/auth/drive"]
-        creds = service_account.Credentials.from_service_account_file(service_account_json_path, scopes=scopes)
+    def __init__(self):
+        client_json = os.getenv("GOOGLE_OAUTH_CLIENT_JSON", "").strip()
+        token_json = os.getenv("GOOGLE_OAUTH_TOKEN_JSON", "").strip()
+        if not client_json or not token_json:
+            raise RuntimeError("missing GOOGLE_OAUTH_CLIENT_JSON or GOOGLE_OAUTH_TOKEN_JSON")
+
+        token_info = json.loads(token_json)
+        creds = Credentials.from_authorized_user_info(token_info, scopes=SCOPES)
+
+        if not creds.valid and creds.refresh_token:
+            creds.refresh(Request())
+
         self.service = build("drive", "v3", credentials=creds, cache_discovery=False)
-        self.shared_drive_id = shared_drive_id
 
     def _list(self, q: str) -> List[dict]:
-        params = {
-            "q": q,
-            "fields": "files(id,name,mimeType,parents)",
-            "pageSize": 50,
-            "supportsAllDrives": True,
-            "includeItemsFromAllDrives": True,
-        }
-        if self.shared_drive_id:
-            params["corpora"] = "drive"
-            params["driveId"] = self.shared_drive_id
-        else:
-            params["corpora"] = "user"
-        res = self.service.files().list(**params).execute()
+        res = self.service.files().list(
+            q=q,
+            fields="files(id,name,mimeType,parents)",
+            pageSize=50,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
         return res.get("files", [])
 
     def upload_or_update(self, local_path: str, drive_folder_id: str, drive_filename: str):
@@ -325,8 +362,11 @@ class DriveUploader:
             ).execute()
 
 
-def session_filename(prefix: str, bucket_ts: int) -> str:
-    return f"{prefix}{bucket_ts}.csv"
+# -----------------------------
+# csv
+# -----------------------------
+def session_filename(prefix: str, market_bucket_ts: int) -> str:
+    return f"{prefix}{market_bucket_ts}.csv"
 
 
 def write_header(writer: csv.writer, quote_notionals_usdc: List[int]):
@@ -338,53 +378,58 @@ def write_header(writer: csv.writer, quote_notionals_usdc: List[int]):
     writer.writerow(headers)
 
 
-def load_quote_notionals() -> List[int]:
-    raw = os.getenv("QUOTE_NOTIONALS_USDC", "")
-    if not raw.strip():
-        return DEFAULT_QUOTE_NOTIONALS_USDC
+def ensure_file_with_header(path: str, quote_notionals_usdc: List[int]) -> None:
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        write_header(w, quote_notionals_usdc)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+
+
+def fsync_flush(f):
     try:
-        vals = [int(x.strip()) for x in raw.split(",") if x.strip()]
-        return vals if vals else DEFAULT_QUOTE_NOTIONALS_USDC
+        f.flush()
     except Exception:
-        return DEFAULT_QUOTE_NOTIONALS_USDC
+        return
+    try:
+        os.fsync(f.fileno())
+    except Exception:
+        pass
 
 
-def ensure_service_account_file() -> str:
-    env_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    if env_json:
-        path = os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH", "/tmp/service_account.json")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(env_json)
-        return path
-    return os.getenv("SERVICE_ACCOUNT_JSON", "service_account.json")
-
-
+# -----------------------------
+# main loop
+# -----------------------------
 def main():
     slug_url = os.getenv("SLUG_URL", DEFAULT_SLUG_URL)
     poll_seconds = float(os.getenv("POLL_SECONDS", str(DEFAULT_POLL_SECONDS)))
-    refresh_session_every = float(os.getenv("REFRESH_SESSION_EVERY_SECONDS", "2.0"))
+    refresh_session_every = float(os.getenv("REFRESH_SESSION_EVERY_SECONDS", str(DEFAULT_REFRESH_SESSION_EVERY_SECONDS)))
     http_timeout_seconds = float(os.getenv("HTTP_TIMEOUT_SECONDS", str(DEFAULT_HTTP_TIMEOUT_SECONDS)))
     local_out_dir = os.getenv("LOCAL_OUT_DIR", DEFAULT_LOCAL_OUT_DIR)
+
+    market_bucket_seconds = int(os.getenv("MARKET_BUCKET_SECONDS", str(DEFAULT_MARKET_BUCKET_SECONDS)))
+    upload_every_seconds = float(os.getenv("UPLOAD_EVERY_SECONDS", str(DEFAULT_UPLOAD_EVERY_SECONDS)))
 
     quote_notionals_usdc = load_quote_notionals()
     notionals = [float(x) for x in quote_notionals_usdc]
 
-    drive_folder_id = os.getenv("DRIVE_FOLDER_ID", DEFAULT_DRIVE_FOLDER_ID).strip()
+    drive_folder_id = os.getenv("DRIVE_FOLDER_ID", "").strip()
     if not drive_folder_id:
-        raise RuntimeError("missing DRIVE_FOLDER_ID env var (set it to your Polymarket Data/btc folder id)")
-
-    shared_drive_id = os.getenv("SHARED_DRIVE_ID", "").strip() or None
-    sa_path = ensure_service_account_file()
+        raise RuntimeError("missing DRIVE_FOLDER_ID env var")
 
     os.makedirs(local_out_dir, exist_ok=True)
 
     initial_slug = parse_slug(slug_url)
     slug_prefix = slug_prefix_from_slug(initial_slug)
 
-    drive = DriveUploader(sa_path, shared_drive_id=shared_drive_id)
+    drive = DriveUploader()
 
-    # one-time startup test upload so you see the real error immediately
+    # one-time startup upload test
     test_path = os.path.join(local_out_dir, "drive_test.csv")
     with open(test_path, "w", encoding="utf-8") as tf:
         tf.write("ok,utc\n")
@@ -407,20 +452,25 @@ def main():
     last_up_asks: List[Tuple[float, float]] = []
     last_down_asks: List[Tuple[float, float]] = []
 
-    current_bucket = current_bucket_ts(SESSION_SECONDS)
-    local_file = os.path.join(local_out_dir, session_filename(slug_prefix, current_bucket))
-    f = open(local_file, "w", newline="", encoding="utf-8")
+    current_market_bucket = current_bucket_ts(market_bucket_seconds)
+    current_slug = f"{slug_prefix}{current_market_bucket}"
+
+    local_file = os.path.join(local_out_dir, session_filename(slug_prefix, current_market_bucket))
+    ensure_file_with_header(local_file, quote_notionals_usdc)
+
+    f = open(local_file, "a", newline="", encoding="utf-8")
     w = csv.writer(f)
-    write_header(w, quote_notionals_usdc)
-    f.flush()
 
     print("drive_folder_id", drive_folder_id)
     print("poll_seconds", poll_seconds)
-    print("session_seconds", SESSION_SECONDS)
+    print("market_bucket_seconds", market_bucket_seconds)
+    print("upload_every_seconds", upload_every_seconds)
     print("local_out_dir", os.path.abspath(local_out_dir))
     print("current_file", os.path.abspath(local_file))
 
-    def close_and_upload(path: str, filename: str) -> bool:
+    last_upload_ts = 0.0
+
+    def upload_with_logs(path: str, filename: str) -> bool:
         for attempt in range(5):
             try:
                 drive.upload_or_update(path, drive_folder_id, filename)
@@ -446,40 +496,46 @@ def main():
         while True:
             loop_start = time.perf_counter()
             now = time.time()
-            bucket = current_bucket_ts(SESSION_SECONDS)
 
-            if bucket != current_bucket:
+            # detect current market session (15m bucket)
+            market_bucket = current_bucket_ts(market_bucket_seconds)
+            if market_bucket != current_market_bucket:
+                # finalize previous file: close, upload, open new
                 try:
-                    f.flush()
+                    fsync_flush(f)
                     f.close()
                 except Exception:
                     pass
 
-                fname = os.path.basename(local_file)
-                ok = close_and_upload(local_file, fname)
-                print("uploaded" if ok else "upload_failed", fname)
+                prev_name = os.path.basename(local_file)
+                ok = upload_with_logs(local_file, prev_name)
+                print("uploaded" if ok else "upload_failed", prev_name)
 
-                current_bucket = bucket
-                local_file = os.path.join(local_out_dir, session_filename(slug_prefix, current_bucket))
-                f = open(local_file, "w", newline="", encoding="utf-8")
+                current_market_bucket = market_bucket
+                current_slug = f"{slug_prefix}{current_market_bucket}"
+
+                local_file = os.path.join(local_out_dir, session_filename(slug_prefix, current_market_bucket))
+                ensure_file_with_header(local_file, quote_notionals_usdc)
+
+                f = open(local_file, "a", newline="", encoding="utf-8")
                 w = csv.writer(f)
-                write_header(w, quote_notionals_usdc)
-                f.flush()
 
+                # reset session-specific caches
                 last_up_asks = []
                 last_down_asks = []
                 state = None
                 last_refresh = 0.0
+                last_upload_ts = 0.0
 
+            # refresh token ids for current session slug
             if state is None or (now - last_refresh) >= refresh_session_every:
                 last_refresh = now
-                target_slug = f"{slug_prefix}{current_bucket}"
                 try:
-                    m = fetch_gamma_market_by_slug(http, target_slug)
+                    m = fetch_gamma_market_by_slug(http, current_slug)
                     if m:
                         up_id, down_id = resolve_up_down_tokens(m)
-                        if state is None or state.slug != target_slug:
-                            state = SessionState(slug=target_slug, up_token_id=up_id, down_token_id=down_id)
+                        if state is None or state.slug != current_slug:
+                            state = SessionState(slug=current_slug, up_token_id=up_id, down_token_id=down_id)
                             print("switched_session", state.slug)
                 except Exception:
                     pass
@@ -488,6 +544,7 @@ def main():
                 time.sleep(0.05)
                 continue
 
+            # fetch order books (asks) safely
             try:
                 up_asks = fetch_order_book_asks_safe(http, state.up_token_id, last_up_asks)
                 if up_asks:
@@ -503,13 +560,14 @@ def main():
                 except Exception:
                     pass
                 http = make_http_client(http_timeout_seconds)
-                time.sleep(0.1)
+                time.sleep(0.15)
                 continue
 
             if not last_up_asks or not last_down_asks:
                 time.sleep(0.05)
                 continue
 
+            # compute multi-notional avg fill
             up_avg = avg_fill_prices_for_notionals(last_up_asks, notionals)
             down_avg = avg_fill_prices_for_notionals(last_down_asks, notionals)
 
@@ -522,7 +580,16 @@ def main():
             row.append(btc_price)
 
             w.writerow(row)
-            f.flush()
+
+            # flush on every tick to minimize data loss
+            fsync_flush(f)
+
+            # optional snapshot uploads during the session (testing or redundancy)
+            if upload_every_seconds > 0 and (now - last_upload_ts) >= upload_every_seconds:
+                last_upload_ts = now
+                name = os.path.basename(local_file)
+                ok = upload_with_logs(local_file, name)
+                print("snapshot_uploaded" if ok else "snapshot_upload_failed", name)
 
             elapsed = time.perf_counter() - loop_start
             sleep_for = poll_seconds - elapsed
@@ -533,7 +600,7 @@ def main():
         pass
     finally:
         try:
-            f.flush()
+            fsync_flush(f)
             f.close()
         except Exception:
             pass
@@ -545,10 +612,11 @@ def main():
 
         feed.stop()
 
+        # final upload attempt
         try:
-            fname = os.path.basename(local_file)
-            ok = close_and_upload(local_file, fname)
-            print("uploaded" if ok else "upload_failed", fname)
+            name = os.path.basename(local_file)
+            ok = upload_with_logs(local_file, name)
+            print("uploaded" if ok else "upload_failed", name)
         except Exception:
             pass
 
